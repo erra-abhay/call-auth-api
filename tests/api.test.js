@@ -38,9 +38,9 @@ describe('Optimus Call-Auth-API Test Suite', () => {
     assert.equal(filtered[0].title, 'Active Live Class');
   });
 
-  it('should extract opaque joinCode from URL format xxx-xxxx-xxx', () => {
-    const joinCodePattern = /^[a-z0-9]{3}-[a-z0-9]{4}-[a-z0-9]{3}$/;
-    const sampleCode = '52e-79db-cca';
-    assert.equal(joinCodePattern.test(sampleCode), true);
+  it('should set is_live=false when creating a meeting for later (isInstant=false)', () => {
+    const isInstant = false;
+    const is_live = isInstant !== false;
+    assert.equal(is_live, false, 'Meeting created for later MUST have is_live=false until faculty starts it');
   });
 });

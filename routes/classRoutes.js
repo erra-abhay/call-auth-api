@@ -97,6 +97,8 @@ router.post('/start', auth, requireRole('faculty'), async (req, res) => {
   const classId = req.body?.classId || 'c001';
   const date = (req.body?.date && req.body.date.match(/^\d{4}-\d{2}-\d{2}$/)) ? req.body.date : todayDate;
 
+  const isInstant = req.body?.isInstant !== false;
+
   let schedule = await getItem('class-schedule', {
     PK: `CLASS#${classId}`,
     SK: `SCHEDULE#${date}`,
@@ -112,8 +114,8 @@ router.post('/start', auth, requireRole('faculty'), async (req, res) => {
       title: req.body?.title || 'Class Session',
       teacher_id: teacherId,
       room_name: roomName,
-      is_live: true,
-      live_started_at: now,
+      is_live: isInstant,
+      live_started_at: isInstant ? now : null,
       created_at: now,
     };
     await putItem('class-schedule', schedule);
