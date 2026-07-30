@@ -5,7 +5,7 @@ import { AccessToken } from 'livekit-server-sdk';
 import { RoomServiceClient } from 'livekit-server-sdk';
 import { auth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
-import { getItem, putItem, updateItem } from '../db/dynamo.js';
+import { getItem, putItem, updateItem, scanItems, queryItems } from '../db/dynamo.js';
 
 const router = Router();
 
@@ -692,7 +692,6 @@ router.post('/create', auth, requireRole('faculty'), async (req, res) => {
 router.get('/history/me', auth, async (req, res) => {
   const userId = req.user.userId;
   const role = req.user.role;
-  const { scanItems } = await import('../db/dynamo.js');
 
   if (role === 'faculty') {
     // Return all sessions this teacher created
@@ -731,6 +730,9 @@ router.get('/history/me', auth, async (req, res) => {
 router.post('/kick', auth, requireRole('faculty'), async (req, res) => {
   const { roomName, identity } = req.body || {};
   if (!roomName || !identity) return res.status(400).json({ error: 'roomName_and_identity_required' });
+  if (identity.toLowerCase() === req.user.userId.toLowerCase()) {
+    return res.status(400).json({ error: 'cannot_kick_self' });
+  }
   try {
     let realRoomName = roomName;
     // Look up joinCode in join-sessions table
