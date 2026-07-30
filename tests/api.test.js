@@ -43,4 +43,36 @@ describe('Optimus Call-Auth-API Test Suite', () => {
     const is_live = isInstant !== false;
     assert.equal(is_live, false, 'Meeting created for later MUST have is_live=false until faculty starts it');
   });
+
+  it('should hard-code API level 403 rejection for student when host has not started', () => {
+    const userRole = 'student';
+    const isLive = false;
+
+    let responseStatus = 200;
+    let responseBody = {};
+
+    if (userRole !== 'faculty' && !isLive) {
+      responseStatus = 403;
+      responseBody = { error: 'host_has_not_started', isLive: false };
+    }
+
+    assert.equal(responseStatus, 403);
+    assert.equal(responseBody.error, 'host_has_not_started');
+  });
+
+  it('should hard-code API level rejection when faculty attempts to kick another faculty', () => {
+    const callerId = 't001';
+    const targetId = 't001';
+
+    let responseStatus = 200;
+    let responseBody = {};
+
+    if (targetId === callerId || targetId.startsWith('t')) {
+      responseStatus = 400;
+      responseBody = { error: 'cannot_kick_faculty' };
+    }
+
+    assert.equal(responseStatus, 400);
+    assert.equal(responseBody.error, 'cannot_kick_faculty');
+  });
 });

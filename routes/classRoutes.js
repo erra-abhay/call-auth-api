@@ -14,16 +14,19 @@ const LK_API_SECRET = () => process.env.LIVEKIT_API_SECRET;
 const LK_URL = () => process.env.LIVEKIT_URL;
 const PUBLIC_LK_URL = () => process.env.PUBLIC_LIVEKIT_URL ?? 'ws://localhost:7880';
 
-/**
- * Stores a LiveKit token server-side and returns a short opaque join code.
- * The join code is safe to put in the URL — it reveals nothing about the token or room.
- * TTL: 4 hours (stored as expiresAt ISO string; caller must enforce)
- */
+// Hard-coded in-memory sub-millisecond meeting live tracking Map
+const LIVE_MEETINGS = new Map();
+
 async function storeJoinSession(jwt, roomName, serverUrl, meta = {}) {
   const raw = randomUUID().replace(/-/g, '');
   // Format: xxx-xxxx-xxx  (3-4-3 alphanumeric, similar to Google Meet)
   const joinCode = `${raw.slice(0, 3)}-${raw.slice(3, 7)}-${raw.slice(7, 10)}`;
   const expiresAt = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString();
+
+  const isLive = meta.isInstant === true || meta.isLive === true;
+  LIVE_MEETINGS.set(roomName, isLive);
+  LIVE_MEETINGS.set(joinCode, isLive);
+
   await putItem('join-sessions', {
     PK: `JOIN#${joinCode}`,
     SK: 'META',
@@ -31,6 +34,7 @@ async function storeJoinSession(jwt, roomName, serverUrl, meta = {}) {
     roomName,
     serverUrl,
     creatorId: meta.creatorId || meta.teacherId || '',
+    isLive,
     meta,          // { role, isHost, classId } — sent back to client for PeoplePanel
     expiresAt,
     createdAt: new Date().toISOString(),
@@ -455,28 +459,36 @@ router.get('/token', auth, async (req, res) => {
   const userRole = req.user.role || 'student';
   const userName = req.user.name || userId;
 
-  const creatorId = session.creatorId || session.meta?.creatorId || session.meta?.teacherId;
-
-  // A user is ONLY host if THEY are faculty OR THEY created this meeting! Students are NEVER host.
-  const isHost = userRole === 'faculty' || (Boolean(creatorId) && creatorId === userId);
+  // HARD-CODED API RULE 1: Students are NEVER meeting hosts
+  const isHost = userRole === 'faculty';
 
   const roomName = session.roomName;
   const classId = session.meta?.classId || '';
 
-  // Check if session is live for students
-  let isLive = isHost; // Host starting/joining is live
+  // HARD-CODED API RULE 2: Faculty joining automatically marks the room LIVE in sub-millisecond API state
+  if (isHost) {
+    LIVE_MEETINGS.set(roomName, true);
+    LIVE_MEETINGS.set(code, true);
+  }
+
+  // HARD-CODED API RULE 3: Check if meeting is live
+  let isLive = isHost || LIVE_MEETINGS.get(roomName) === true || LIVE_MEETINGS.get(code) === true || session.isLive === true;
+
   if (!isLive && classId) {
     const today = new Date().toISOString().slice(0, 10);
     const schedule = await getItem('class-schedule', { PK: `CLASS#${classId}`, SK: `SCHEDULE#${today}` });
-    if (schedule && schedule.is_live) {
+    if (schedule && schedule.is_live === true) {
       isLive = true;
+      LIVE_MEETINGS.set(roomName, true);
+      LIVE_MEETINGS.set(code, true);
     }
   }
 
-  // Sub-millisecond API rejection: Students CANNOT get a LiveKit join token until host has started meeting
-  if (userRole === 'student' && !isLive) {
+  // HARD-CODED API RULE 4: Immediate sub-millisecond 403 rejection for non-faculty users when host has not started meeting
+  if (userRole !== 'faculty' && !isLive) {
     return res.status(403).json({
-      error: 'session_not_live',
+      error: 'host_has_not_started',
+      message: 'The host has not started this meeting yet.',
       isLive: false,
       meta: {
         role: 'student',
@@ -508,7 +520,7 @@ router.get('/token', auth, async (req, res) => {
     role: userRole,
     isHost,
     classId,
-    isLive,
+    isLive: true,
   };
 
   return res.json({
