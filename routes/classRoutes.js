@@ -161,6 +161,85 @@ router.post('/start', auth, requireRole('faculty'), async (req, res) => {
 });
 
 /**
+ * Helper to record session completion across class-schedule and meeting-history
+ */
+async function recordSessionEnd(scheduleKey, schedule, userId) {
+  const now = new Date().toISOString();
+  const classId = schedule.class_id || schedule.PK?.replace('CLASS#', '') || `c_${Date.now()}`;
+  const teacherId = schedule.teacher_id || userId;
+  const todayDate = schedule.SK?.replace('SCHEDULE#', '') || now.slice(0, 10);
+  const title = schedule.class_name || schedule.title || 'Class Meeting';
+
+  // Mark completed in class-schedule
+  await updateItem({
+    TableName: 'class-schedule',
+    Key: scheduleKey,
+    UpdateExpression: 'SET is_live = :live, live_ended_at = :ts, #st = :status',
+    ExpressionAttributeNames: { '#st': 'status' },
+    ExpressionAttributeValues: { ':live': false, ':ts': now, ':status': 'completed' },
+  });
+
+  const sessionId = `${classId}-${Date.now()}`;
+
+  // 1. Log class record
+  await putItem('meeting-history', {
+    PK: `CLASS#${classId}`,
+    SK: `SESSION#${sessionId}`,
+    session_id: sessionId,
+    class_id: classId,
+    class_name: title,
+    teacher_id: teacherId,
+    room_name: schedule.room_name,
+    started_at: schedule.live_started_at || schedule.created_at || now,
+    ended_at: now,
+    date: todayDate,
+    branch: schedule.branch || '',
+    section: schedule.section || '',
+    grade_class: schedule.grade_class || '',
+    type: 'class',
+  });
+
+  // 2. Log teacher history record
+  await putItem('meeting-history', {
+    PK: `TEACHER#${teacherId}`,
+    SK: `SESSION#${sessionId}`,
+    session_id: sessionId,
+    class_id: classId,
+    class_name: title,
+    teacher_id: teacherId,
+    room_name: schedule.room_name,
+    started_at: schedule.live_started_at || schedule.created_at || now,
+    ended_at: now,
+    date: todayDate,
+    type: 'class',
+  });
+
+  // 3. Log for all students who enrolled or participated
+  try {
+    const enrollments = await scanItems('class-enrollment');
+    const classEnrollments = enrollments.filter(e => e.SK === `CLASS#${classId}`);
+    for (const e of classEnrollments) {
+      const studentId = e.PK.replace('STUDENT#', '');
+      await putItem('meeting-history', {
+        PK: `STUDENT#${studentId}`,
+        SK: `SESSION#${sessionId}`,
+        session_id: sessionId,
+        class_id: classId,
+        class_name: title,
+        teacher_id: teacherId,
+        joined_at: schedule.live_started_at || schedule.created_at || now,
+        left_at: now,
+        type: 'class',
+      });
+    }
+  } catch (err) {
+    console.error('Failed writing student meeting history', err);
+  }
+
+  return sessionId;
+}
+
+/**
  * POST /class/end  (faculty only)
  * Ends a live session, deletes the LiveKit room (kicks all), and logs to meeting-history.
  */
@@ -189,48 +268,30 @@ router.post('/end', auth, requireRole('faculty'), async (req, res) => {
     // Room may already be empty/deleted — not fatal
   }
 
-  const now = new Date().toISOString();
-  await updateItem({
-    TableName: 'class-schedule',
-    Key: { PK: `CLASS#${classId}`, SK: `SCHEDULE#${todayDate}` },
-    UpdateExpression: 'SET is_live = :live, live_ended_at = :ts',
-    ExpressionAttributeValues: { ':live': false, ':ts': now },
-  });
-
-  // Log session to meeting-history for the history page
-  const sessionId = `${classId}-${Date.now()}`;
-  await putItem('meeting-history', {
-    PK: `CLASS#${classId}`,
-    SK: `SESSION#${sessionId}`,
-    session_id: sessionId,
-    class_id: classId,
-    class_name: schedule.class_name || schedule.title || 'Class Session',
-    teacher_id: teacherId,
-    room_name: schedule.room_name,
-    started_at: schedule.live_started_at || now,
-    ended_at: now,
-    date: todayDate,
-    branch: schedule.branch || '',
-    section: schedule.section || '',
-    grade_class: schedule.grade_class || '',
-  });
-
-  // Also store a student-facing summary row (PK = TEACHER#{teacherId} for faculty history)
-  await putItem('meeting-history', {
-    PK: `TEACHER#${teacherId}`,
-    SK: `SESSION#${sessionId}`,
-    session_id: sessionId,
-    class_id: classId,
-    class_name: schedule.class_name || schedule.title || 'Class Session',
-    teacher_id: teacherId,
-    room_name: schedule.room_name,
-    started_at: schedule.live_started_at || now,
-    ended_at: now,
-    date: todayDate,
-    type: 'class',
-  });
+  const sessionId = await recordSessionEnd({ PK: `CLASS#${classId}`, SK: `SCHEDULE#${todayDate}` }, schedule, teacherId);
 
   return res.json({ ok: true, sessionId });
+});
+
+/**
+ * POST /class/end-room  (any authenticated user on room disconnect)
+ * Ends a session by roomName, updates schedule, and logs to meeting-history.
+ */
+router.post('/end-room', auth, async (req, res) => {
+  const { roomName } = req.body || {};
+  if (!roomName) return res.status(400).json({ error: 'roomName_required' });
+
+  try {
+    await getRoomService().deleteRoom(roomName);
+  } catch {}
+
+  const allSchedules = await scanItems('class-schedule');
+  const schedule = allSchedules.find(s => s.room_name === roomName || s.roomName === roomName);
+  if (schedule) {
+    await recordSessionEnd({ PK: schedule.PK, SK: schedule.SK }, schedule, req.user.userId);
+  }
+
+  return res.json({ ok: true });
 });
 
 /**

@@ -46,6 +46,10 @@ router.get('/classes/today', auth, async (req, res) => {
   // 1. Fetch all items from class-schedule
   const allSchedules = await scanItems('class-schedule');
   const todaySchedules = allSchedules.filter((item) => {
+    // Exclude completed or ended meetings — once ended, they move to session history and leave dashboard
+    if (item.is_live === false || item.live_ended_at || item.status === 'completed') {
+      return false;
+    }
     return (
       item.SK === `SCHEDULE#${today}` ||
       item.SK?.startsWith(`SCHEDULE#${today}`) ||

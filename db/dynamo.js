@@ -29,10 +29,12 @@ export async function queryItems(params) {
 }
 
 /**
- * Scan with ConsistentRead: true.
+ * Scan with optional filter params and ConsistentRead: true.
+ * @param {string} TableName
+ * @param {object} [params] — optional ScanCommand extra params (FilterExpression, ExpressionAttributeValues, etc.)
  */
-export async function scanItems(TableName) {
-  const result = await ddb.send(new ScanCommand({ TableName, ConsistentRead: true }));
+export async function scanItems(TableName, params = {}) {
+  const result = await ddb.send(new ScanCommand({ TableName, ConsistentRead: true, ...params }));
   return result.Items ?? [];
 }
 
