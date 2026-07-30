@@ -454,10 +454,22 @@ router.get('/token', auth, async (req, res) => {
   const userName = req.user.name || userId;
 
   const creatorId = session.creatorId || session.meta?.creatorId || session.meta?.teacherId;
-  const isHost = userRole === 'faculty' || (creatorId && creatorId === userId) || session.meta?.isHost === true;
+
+  // A user is ONLY host if THEY are faculty OR THEY created this meeting! Students are NEVER host.
+  const isHost = userRole === 'faculty' || (Boolean(creatorId) && creatorId === userId);
 
   const roomName = session.roomName;
   const classId = session.meta?.classId || '';
+
+  // Check if session is live for students
+  let isLive = isHost; // Host starting/joining is live
+  if (!isLive && classId) {
+    const today = new Date().toISOString().slice(0, 10);
+    const schedule = await getItem('class-schedule', { PK: `CLASS#${classId}`, SK: `SCHEDULE#${today}` });
+    if (schedule && schedule.is_live) {
+      isLive = true;
+    }
+  }
 
   // Mint a personalized token for THIS requesting user (NOT the creator's raw token)
   const token = new AccessToken(LK_API_KEY(), LK_API_SECRET(), {
@@ -480,6 +492,7 @@ router.get('/token', auth, async (req, res) => {
     role: userRole,
     isHost,
     classId,
+    isLive,
   };
 
   return res.json({
