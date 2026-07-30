@@ -14,6 +14,28 @@ const LK_API_SECRET = () => process.env.LIVEKIT_API_SECRET;
 const LK_URL = () => process.env.LIVEKIT_URL;
 const PUBLIC_LK_URL = () => process.env.PUBLIC_LIVEKIT_URL ?? 'ws://localhost:7880';
 
+/**
+ * Stores a LiveKit token server-side and returns a short opaque join code.
+ * The join code is safe to put in the URL — it reveals nothing about the token or room.
+ * TTL: 4 hours (stored as expiresAt ISO string; caller must enforce)
+ */
+async function storeJoinSession(jwt, roomName, serverUrl) {
+  const raw = randomUUID().replace(/-/g, '');
+  // Format: xxx-xxxx-xxx  (3-4-3 alphanumeric, similar to Google Meet)
+  const joinCode = `${raw.slice(0, 3)}-${raw.slice(3, 7)}-${raw.slice(7, 10)}`;
+  const expiresAt = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString();
+  await putItem('join-sessions', {
+    PK: `JOIN#${joinCode}`,
+    SK: 'META',
+    token: jwt,
+    roomName,
+    serverUrl,
+    expiresAt,
+    createdAt: new Date().toISOString(),
+  });
+  return joinCode;
+}
+
 function getRoomService() {
   // Convert ws:// to http:// for the REST API
   const httpUrl = LK_URL().replace(/^ws(s?):\/\//, 'http$1://');
@@ -125,7 +147,9 @@ router.post('/start', auth, requireRole('faculty'), async (req, res) => {
     decision: 'allowed',
   });
 
-  return res.json({ token: jwt, roomName, serverUrl: PUBLIC_LK_URL() });
+  // Store token server-side — return opaque join code (not the raw JWT)
+  const joinCode = await storeJoinSession(jwt, roomName, PUBLIC_LK_URL());
+  return res.json({ joinCode, roomName, serverUrl: PUBLIC_LK_URL() });
 });
 
 /**
@@ -170,6 +194,8 @@ router.post('/end', auth, requireRole('faculty'), async (req, res) => {
 /**
  * POST /class/join  (student only)
  * Issues a student token with canPublish: false (default closed).
+ * - If the class is currently live (is_live=true), any authenticated student can join.
+ * - If not live, the student must be enrolled to join.
  */
 router.post('/join', auth, requireRole('student'), async (req, res) => {
   const parsed = joinSchema.safeParse(req.body);
@@ -182,12 +208,6 @@ router.post('/join', auth, requireRole('student'), async (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
   const now = Date.now();
 
-  // Check enrollment
-  const enrollment = await getItem('class-enrollment', {
-    PK: `STUDENT#${studentId}`,
-    SK: `CLASS#${classId}`,
-  });
-
   const auditBase = {
     PK: `ROOM#class-${classId}-${today}`,
     SK: `USER#${studentId}#${Date.now()}`,
@@ -196,16 +216,7 @@ router.post('/join', auth, requireRole('student'), async (req, res) => {
     expires_at: new Date(now + 4 * 60 * 60 * 1000).toISOString(),
   };
 
-  if (!enrollment || enrollment.status !== 'active') {
-    await putItem('call-tokens-issued', {
-      ...auditBase,
-      decision: 'denied',
-      denial_reason: 'not_enrolled',
-    });
-    return res.status(403).json({ error: 'not_enrolled' });
-  }
-
-  // Check schedule + live status + grace window
+  // First fetch the schedule to check live status
   const schedule = await getItem('class-schedule', {
     PK: `CLASS#${classId}`,
     SK: `SCHEDULE#${today}`,
@@ -217,20 +228,31 @@ router.post('/join', auth, requireRole('student'), async (req, res) => {
   }
 
   if (!schedule.is_live) {
+    // Not live yet — require enrollment
+    const enrollment = await getItem('class-enrollment', {
+      PK: `STUDENT#${studentId}`,
+      SK: `CLASS#${classId}`,
+    });
+    if (!enrollment || enrollment.status !== 'active') {
+      await putItem('call-tokens-issued', { ...auditBase, decision: 'denied', denial_reason: 'not_enrolled' });
+      return res.status(403).json({ error: 'not_enrolled' });
+    }
     await putItem('call-tokens-issued', { ...auditBase, decision: 'denied', denial_reason: 'session_not_live' });
     return res.status(403).json({ error: 'session_not_live' });
   }
 
-  const grace = (schedule.grace_period_minutes ?? 10) * 60 * 1000;
-  const start = new Date(schedule.start_time).getTime();
-  const end = new Date(schedule.end_time).getTime();
-
-  if (now < start - grace || now > end + grace) {
-    await putItem('call-tokens-issued', { ...auditBase, decision: 'denied', denial_reason: 'outside_schedule_window' });
-    return res.status(403).json({ error: 'outside_schedule_window' });
+  // Class is live — check time window only if end_time is set
+  if (schedule.start_time && schedule.end_time) {
+    const grace = (schedule.grace_period_minutes ?? 10) * 60 * 1000;
+    const start = new Date(schedule.start_time).getTime();
+    const end = new Date(schedule.end_time).getTime();
+    if (now < start - grace || now > end + grace) {
+      await putItem('call-tokens-issued', { ...auditBase, decision: 'denied', denial_reason: 'outside_schedule_window' });
+      return res.status(403).json({ error: 'outside_schedule_window' });
+    }
   }
 
-  // Mint student token: canPublish: false (spec §6.2 — default closed)
+  // Class is live — any authenticated student can join
   const roomName = schedule.room_name;
   const token = new AccessToken(LK_API_KEY(), LK_API_SECRET(), { identity: studentId });
   token.ttl = '4h';
@@ -245,7 +267,37 @@ router.post('/join', auth, requireRole('student'), async (req, res) => {
 
   await putItem('call-tokens-issued', { ...auditBase, decision: 'allowed' });
 
-  return res.json({ token: jwt, roomName, serverUrl: PUBLIC_LK_URL() });
+  // Store token server-side — return opaque join code (not the raw JWT)
+  const joinCode = await storeJoinSession(jwt, roomName, PUBLIC_LK_URL());
+  return res.json({ joinCode, roomName, serverUrl: PUBLIC_LK_URL() });
+});
+
+/**
+ * GET /class/token?code=abc-defg-xyz
+ * Exchanges an opaque join code for the real LiveKit token.
+ * Requires a valid session (auth cookie). The join code is single-use-friendly and short-lived.
+ */
+router.get('/token', auth, async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).json({ error: 'code_required' });
+
+  const session = await getItem('join-sessions', {
+    PK: `JOIN#${code}`,
+    SK: 'META',
+  });
+
+  if (!session) return res.status(404).json({ error: 'invalid_code' });
+
+  // Check expiry
+  if (new Date(session.expiresAt) < new Date()) {
+    return res.status(403).json({ error: 'code_expired' });
+  }
+
+  return res.json({
+    token: session.token,
+    roomName: session.roomName,
+    serverUrl: session.serverUrl,
+  });
 });
 
 /**
