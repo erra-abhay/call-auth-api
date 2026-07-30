@@ -21,6 +21,7 @@ const users = [
   { _id: 'p001', role: 'parent',   profile: { name: 'Priya Sharma'               }, password: 'parent123'  },
   { _id: 'p002', role: 'parent',   profile: { name: 'Rahul Sharma'               }, password: 'parent456'  },
   { _id: 't001', role: 'faculty',  profile: { name: 'Ms. Anita Verma'            }, password: 'faculty123' },
+  { _id: 'admin', role: 'admin',   profile: { name: 'Optimus Admin'              }, password: 'admin123'   },
 ];
 
 for (const u of users) {

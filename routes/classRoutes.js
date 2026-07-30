@@ -539,14 +539,42 @@ router.get('/token', auth, async (req, res) => {
 router.get('/status', auth, async (req, res) => {
   const { joinCode, classId } = req.query;
 
+  // 1. Check in-memory Map first for instant sub-millisecond check
+  if (joinCode && (LIVE_MEETINGS.get(joinCode) === true)) {
+    return res.json({
+      classId: classId || '',
+      is_live: true,
+      class_name: 'Class Session',
+    });
+  }
+
   // Resolve classId from joinCode if not provided directly
   let resolvedClassId = classId;
+  let session = null;
   if (!resolvedClassId && joinCode) {
-    const session = await getItem('join-sessions', { PK: `JOIN#${joinCode}`, SK: 'META' });
+    session = await getItem('join-sessions', { PK: `JOIN#${joinCode}`, SK: 'META' });
     if (session?.meta?.classId) resolvedClassId = session.meta.classId;
-    else return res.status(404).json({ error: 'invalid_code' });
   }
-  if (!resolvedClassId) return res.status(400).json({ error: 'classId_or_joinCode_required' });
+
+  // If in-memory is live for resolved roomName
+  if (session?.roomName && (LIVE_MEETINGS.get(session.roomName) === true)) {
+    return res.json({
+      classId: resolvedClassId || '',
+      is_live: true,
+      class_name: 'Class Session',
+    });
+  }
+
+  if (!resolvedClassId) {
+    if (session && session.isLive) {
+      return res.json({
+        classId: '',
+        is_live: true,
+        class_name: 'Class Session',
+      });
+    }
+    return res.status(400).json({ error: 'classId_or_joinCode_required' });
+  }
 
   const today = new Date().toISOString().slice(0, 10);
   const schedule = await getItem('class-schedule', {
@@ -554,11 +582,24 @@ router.get('/status', auth, async (req, res) => {
     SK: `SCHEDULE#${today}`,
   });
 
-  if (!schedule) return res.status(404).json({ error: 'no_schedule' });
+  if (!schedule) {
+    if (session && (session.isLive || LIVE_MEETINGS.get(session.roomName) === true)) {
+      return res.json({
+        classId: resolvedClassId,
+        is_live: true,
+        class_name: 'Class Session',
+      });
+    }
+    return res.status(404).json({ error: 'no_schedule' });
+  }
+
+  const isLive = schedule.is_live === true || 
+                 (schedule.room_name && LIVE_MEETINGS.get(schedule.room_name) === true) || 
+                 (joinCode && LIVE_MEETINGS.get(joinCode) === true);
 
   return res.json({
     classId: resolvedClassId,
-    is_live: schedule.is_live ?? false,
+    is_live: isLive,
     class_name: schedule.class_name || schedule.title || '',
     teacher_id: schedule.teacher_id,
   });
