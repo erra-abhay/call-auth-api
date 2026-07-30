@@ -471,6 +471,20 @@ router.get('/token', auth, async (req, res) => {
     }
   }
 
+  // Sub-millisecond API rejection: Students CANNOT get a LiveKit join token until host has started meeting
+  if (userRole === 'student' && !isLive) {
+    return res.status(403).json({
+      error: 'session_not_live',
+      isLive: false,
+      meta: {
+        role: 'student',
+        isHost: false,
+        isLive: false,
+        classId,
+      },
+    });
+  }
+
   // Mint a personalized token for THIS requesting user (NOT the creator's raw token)
   const token = new AccessToken(LK_API_KEY(), LK_API_SECRET(), {
     identity: userId,
