@@ -71,6 +71,20 @@ const tables = [
     ],
     BillingMode: 'PAY_PER_REQUEST',
   },
+  {
+    // Stores opaque join codes → {token, roomName, serverUrl} for secure token exchange
+    // Token never appears in the URL; the short join code is what goes in /rooms/{code}
+    TableName: 'join-sessions',
+    AttributeDefinitions: [
+      { AttributeName: 'PK', AttributeType: 'S' },
+      { AttributeName: 'SK', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'PK', KeyType: 'HASH' },
+      { AttributeName: 'SK', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  },
 ];
 
 async function tableExists(name) {
