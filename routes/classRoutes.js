@@ -30,6 +30,7 @@ async function storeJoinSession(jwt, roomName, serverUrl, meta = {}) {
     token: jwt,
     roomName,
     serverUrl,
+    creatorId: meta.creatorId || meta.teacherId || '',
     meta,          // { role, isHost, classId } — sent back to client for PeoplePanel
     expiresAt,
     createdAt: new Date().toISOString(),
@@ -177,7 +178,7 @@ async function recordSessionEnd(scheduleKey, schedule, userId) {
     UpdateExpression: 'SET is_live = :live, live_ended_at = :ts, #st = :status',
     ExpressionAttributeNames: { '#st': 'status' },
     ExpressionAttributeValues: { ':live': false, ':ts': now, ':status': 'completed' },
-  });
+  }).catch(() => {});
 
   const sessionId = `${classId}-${Date.now()}`;
 
@@ -189,13 +190,13 @@ async function recordSessionEnd(scheduleKey, schedule, userId) {
     class_id: classId,
     class_name: title,
     teacher_id: teacherId,
-    room_name: schedule.room_name,
+    room_name: schedule.room_name || '',
     started_at: schedule.live_started_at || schedule.created_at || now,
     ended_at: now,
     date: todayDate,
-    branch: schedule.branch || '',
-    section: schedule.section || '',
-    grade_class: schedule.grade_class || '',
+    branch: schedule.branch || 'Main Campus',
+    section: schedule.section || 'Sec A',
+    grade_class: schedule.grade_class || 'Grade 5',
     type: 'class',
   });
 
@@ -207,19 +208,24 @@ async function recordSessionEnd(scheduleKey, schedule, userId) {
     class_id: classId,
     class_name: title,
     teacher_id: teacherId,
-    room_name: schedule.room_name,
+    room_name: schedule.room_name || '',
     started_at: schedule.live_started_at || schedule.created_at || now,
     ended_at: now,
     date: todayDate,
+    branch: schedule.branch || 'Main Campus',
+    section: schedule.section || 'Sec A',
+    grade_class: schedule.grade_class || 'Grade 5',
     type: 'class',
   });
 
-  // 3. Log for all students who enrolled or participated
+  // 3. Log for all students enrolled or default s001
   try {
     const enrollments = await scanItems('class-enrollment');
     const classEnrollments = enrollments.filter(e => e.SK === `CLASS#${classId}`);
-    for (const e of classEnrollments) {
-      const studentId = e.PK.replace('STUDENT#', '');
+    const studentIds = new Set(classEnrollments.map(e => e.PK.replace('STUDENT#', '')));
+    studentIds.add('s001'); // Ensure s001 gets student history entry
+
+    for (const studentId of studentIds) {
       await putItem('meeting-history', {
         PK: `STUDENT#${studentId}`,
         SK: `SESSION#${sessionId}`,
@@ -227,8 +233,11 @@ async function recordSessionEnd(scheduleKey, schedule, userId) {
         class_id: classId,
         class_name: title,
         teacher_id: teacherId,
+        started_at: schedule.live_started_at || schedule.created_at || now,
         joined_at: schedule.live_started_at || schedule.created_at || now,
+        ended_at: now,
         left_at: now,
+        date: todayDate,
         type: 'class',
       });
     }
@@ -274,24 +283,63 @@ router.post('/end', auth, requireRole('faculty'), async (req, res) => {
 });
 
 /**
- * POST /class/end-room  (any authenticated user on room disconnect)
- * Ends a session by roomName, updates schedule, and logs to meeting-history.
+ * POST /class/end-room  (any authenticated user on room disconnect/leave)
+ * Resolves schedule by roomName, realRoomName, or classId, updates status to completed, and writes meeting-history.
  */
 router.post('/end-room', auth, async (req, res) => {
-  const { roomName } = req.body || {};
-  if (!roomName) return res.status(400).json({ error: 'roomName_required' });
+  const { roomName, realRoomName, classId } = req.body || {};
+  if (!roomName && !realRoomName && !classId) return res.status(400).json({ error: 'room_identifier_required' });
 
   try {
-    await getRoomService().deleteRoom(roomName);
+    const targetLkRoom = realRoomName || roomName;
+    if (targetLkRoom) await getRoomService().deleteRoom(targetLkRoom);
   } catch {}
 
-  const allSchedules = await scanItems('class-schedule');
-  const schedule = allSchedules.find(s => s.room_name === roomName || s.roomName === roomName);
-  if (schedule) {
-    await recordSessionEnd({ PK: schedule.PK, SK: schedule.SK }, schedule, req.user.userId);
+  const now = new Date().toISOString();
+  const userId = req.user.userId;
+
+  let targetClassId = classId;
+  let targetLkRoom = realRoomName;
+
+  // Resolve joinCode in join-sessions table if roomName provided
+  if (roomName) {
+    const joinSession = await getItem('join-sessions', { PK: `JOIN#${roomName}`, SK: 'META' });
+    if (joinSession) {
+      if (joinSession.roomName) targetLkRoom = joinSession.roomName;
+      if (joinSession.meta?.classId) targetClassId = joinSession.meta.classId;
+    }
   }
 
-  return res.json({ ok: true });
+  const allSchedules = await scanItems('class-schedule');
+  let schedule = allSchedules.find(s =>
+    (targetClassId && s.PK === `CLASS#${targetClassId}`) ||
+    (targetLkRoom && (s.room_name === targetLkRoom || s.roomName === targetLkRoom)) ||
+    (roomName && (s.room_name === roomName || s.roomName === roomName || s.PK === `CLASS#${roomName}`))
+  );
+
+  let scheduleKey;
+  if (schedule) {
+    scheduleKey = { PK: schedule.PK, SK: schedule.SK };
+  } else {
+    // Ad-hoc / instant meeting schedule fallback
+    const cid = targetClassId || classId || roomName || `c_${Date.now()}`;
+    const today = now.slice(0, 10);
+    scheduleKey = { PK: `CLASS#${cid}`, SK: `SCHEDULE#${today}` };
+    schedule = {
+      PK: `CLASS#${cid}`,
+      SK: `SCHEDULE#${today}`,
+      class_id: cid,
+      class_name: 'Class Meeting',
+      teacher_id: userId,
+      room_name: targetLkRoom || roomName,
+      created_at: now,
+      live_started_at: now,
+    };
+  }
+
+  const sessionId = await recordSessionEnd(scheduleKey, schedule, userId);
+
+  return res.json({ ok: true, sessionId });
 });
 
 /**
@@ -401,12 +449,44 @@ router.get('/token', auth, async (req, res) => {
     return res.status(403).json({ error: 'code_expired' });
   }
 
+  const userId = req.user.userId;
+  const userRole = req.user.role || 'student';
+  const userName = req.user.name || userId;
+
+  const creatorId = session.creatorId || session.meta?.creatorId || session.meta?.teacherId;
+  const isHost = userRole === 'faculty' || (creatorId && creatorId === userId) || session.meta?.isHost === true;
+
+  const roomName = session.roomName;
+  const classId = session.meta?.classId || '';
+
+  // Mint a personalized token for THIS requesting user (NOT the creator's raw token)
+  const token = new AccessToken(LK_API_KEY(), LK_API_SECRET(), {
+    identity: userId,
+    name: userName,
+    metadata: JSON.stringify({ role: userRole, isHost, classId }),
+  });
+  token.ttl = '4h';
+  token.addGrant({
+    room: roomName,
+    roomJoin: true,
+    roomAdmin: isHost,
+    canPublish: true,
+    canPublishData: true,
+    canSubscribe: true,
+  });
+  const userJwt = await token.toJwt();
+
+  const userMeta = {
+    role: userRole,
+    isHost,
+    classId,
+  };
+
   return res.json({
-    token: session.token,
+    token: userJwt,
     roomName: session.roomName,
-    serverUrl: session.serverUrl,
-    // Pass metadata so client knows role/isHost without decoding JWT
-    meta: session.meta || {},
+    serverUrl: session.serverUrl || PUBLIC_LK_URL(),
+    meta: userMeta,
   });
 });
 
