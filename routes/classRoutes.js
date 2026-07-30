@@ -623,8 +623,19 @@ router.post('/kick', auth, requireRole('faculty'), async (req, res) => {
   const { roomName, identity } = req.body || {};
   if (!roomName || !identity) return res.status(400).json({ error: 'roomName_and_identity_required' });
   try {
-    await getRoomService().removeParticipant(roomName, identity);
-    return res.json({ ok: true });
+    let realRoomName = roomName;
+    // Look up joinCode in join-sessions table
+    const session = await getItem('join-sessions', { PK: `JOIN#${roomName}`, SK: 'META' });
+    if (session && session.roomName) {
+      realRoomName = session.roomName;
+    } else {
+      // Look up schedule by room_name
+      const allSchedules = await scanItems('class-schedule');
+      const sched = allSchedules.find(s => s.room_name === roomName || s.roomName === roomName);
+      if (sched && sched.room_name) realRoomName = sched.room_name;
+    }
+    await getRoomService().removeParticipant(realRoomName, identity);
+    return res.json({ ok: true, realRoomName });
   } catch (err) {
     console.error('[kick] error:', err);
     return res.status(500).json({ error: 'kick_failed', detail: err?.message });
