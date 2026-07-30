@@ -19,7 +19,7 @@ const PUBLIC_LK_URL = () => process.env.PUBLIC_LIVEKIT_URL ?? 'ws://localhost:78
  * The join code is safe to put in the URL — it reveals nothing about the token or room.
  * TTL: 4 hours (stored as expiresAt ISO string; caller must enforce)
  */
-async function storeJoinSession(jwt, roomName, serverUrl) {
+async function storeJoinSession(jwt, roomName, serverUrl, meta = {}) {
   const raw = randomUUID().replace(/-/g, '');
   // Format: xxx-xxxx-xxx  (3-4-3 alphanumeric, similar to Google Meet)
   const joinCode = `${raw.slice(0, 3)}-${raw.slice(3, 7)}-${raw.slice(7, 10)}`;
@@ -30,6 +30,7 @@ async function storeJoinSession(jwt, roomName, serverUrl) {
     token: jwt,
     roomName,
     serverUrl,
+    meta,          // { role, isHost, classId } — sent back to client for PeoplePanel
     expiresAt,
     createdAt: new Date().toISOString(),
   });
@@ -125,12 +126,19 @@ router.post('/start', auth, requireRole('faculty'), async (req, res) => {
     });
   }
 
-  // Mint teacher token: full publish + subscribe
-  const token = new AccessToken(LK_API_KEY(), LK_API_SECRET(), { identity: teacherId });
+  // Mint teacher token: full publish + subscribe + room admin
+  // metadata is embedded in the JWT so the client can read isHost without extra API calls
+  const teacherName = req.user.name || teacherId;
+  const token = new AccessToken(LK_API_KEY(), LK_API_SECRET(), {
+    identity: teacherId,
+    name: teacherName,
+    metadata: JSON.stringify({ role: 'faculty', isHost: true, classId }),
+  });
   token.ttl = '4h';
   token.addGrant({
     room: roomName,
     roomJoin: true,
+    roomAdmin: true,
     canPublish: true,
     canPublishData: true,
     canSubscribe: true,
@@ -148,13 +156,13 @@ router.post('/start', auth, requireRole('faculty'), async (req, res) => {
   });
 
   // Store token server-side — return opaque join code (not the raw JWT)
-  const joinCode = await storeJoinSession(jwt, roomName, PUBLIC_LK_URL());
+  const joinCode = await storeJoinSession(jwt, roomName, PUBLIC_LK_URL(), { classId, role: 'faculty', isHost: true });
   return res.json({ joinCode, roomName, serverUrl: PUBLIC_LK_URL() });
 });
 
 /**
  * POST /class/end  (faculty only)
- * Ends a live session and deletes the LiveKit room (kicks all participants).
+ * Ends a live session, deletes the LiveKit room (kicks all), and logs to meeting-history.
  */
 router.post('/end', auth, requireRole('faculty'), async (req, res) => {
   const parsed = startSchema.safeParse(req.body);
@@ -164,10 +172,11 @@ router.post('/end', auth, requireRole('faculty'), async (req, res) => {
 
   const { classId, date } = parsed.data;
   const teacherId = req.user.userId;
+  const todayDate = date ?? new Date().toISOString().slice(0, 10);
 
   const schedule = await getItem('class-schedule', {
     PK: `CLASS#${classId}`,
-    SK: `SCHEDULE#${date}`,
+    SK: `SCHEDULE#${todayDate}`,
   });
 
   if (!schedule) return res.status(404).json({ error: 'no_schedule' });
@@ -183,12 +192,45 @@ router.post('/end', auth, requireRole('faculty'), async (req, res) => {
   const now = new Date().toISOString();
   await updateItem({
     TableName: 'class-schedule',
-    Key: { PK: `CLASS#${classId}`, SK: `SCHEDULE#${date}` },
+    Key: { PK: `CLASS#${classId}`, SK: `SCHEDULE#${todayDate}` },
     UpdateExpression: 'SET is_live = :live, live_ended_at = :ts',
     ExpressionAttributeValues: { ':live': false, ':ts': now },
   });
 
-  return res.json({ ok: true });
+  // Log session to meeting-history for the history page
+  const sessionId = `${classId}-${Date.now()}`;
+  await putItem('meeting-history', {
+    PK: `CLASS#${classId}`,
+    SK: `SESSION#${sessionId}`,
+    session_id: sessionId,
+    class_id: classId,
+    class_name: schedule.class_name || schedule.title || 'Class Session',
+    teacher_id: teacherId,
+    room_name: schedule.room_name,
+    started_at: schedule.live_started_at || now,
+    ended_at: now,
+    date: todayDate,
+    branch: schedule.branch || '',
+    section: schedule.section || '',
+    grade_class: schedule.grade_class || '',
+  });
+
+  // Also store a student-facing summary row (PK = TEACHER#{teacherId} for faculty history)
+  await putItem('meeting-history', {
+    PK: `TEACHER#${teacherId}`,
+    SK: `SESSION#${sessionId}`,
+    session_id: sessionId,
+    class_id: classId,
+    class_name: schedule.class_name || schedule.title || 'Class Session',
+    teacher_id: teacherId,
+    room_name: schedule.room_name,
+    started_at: schedule.live_started_at || now,
+    ended_at: now,
+    date: todayDate,
+    type: 'class',
+  });
+
+  return res.json({ ok: true, sessionId });
 });
 
 /**
@@ -254,13 +296,18 @@ router.post('/join', auth, requireRole('student'), async (req, res) => {
 
   // Class is live — any authenticated student can join
   const roomName = schedule.room_name;
-  const token = new AccessToken(LK_API_KEY(), LK_API_SECRET(), { identity: studentId });
+  const studentName = req.user.name || studentId;
+  const token = new AccessToken(LK_API_KEY(), LK_API_SECRET(), {
+    identity: studentId,
+    name: studentName,
+    metadata: JSON.stringify({ role: 'student', isHost: false, classId }),
+  });
   token.ttl = '4h';
   token.addGrant({
     room: roomName,
     roomJoin: true,
-    canPublish: false,      // default closed — must be approved by teacher to speak
-    canPublishData: true,   // allow data channel (mic requests)
+    canPublish: true,     // students CAN publish camera/mic — they join with UI defaults off
+    canPublishData: true, // allow data channel (chat, mic requests)
     canSubscribe: true,
   });
   const jwt = await token.toJwt();
@@ -268,7 +315,7 @@ router.post('/join', auth, requireRole('student'), async (req, res) => {
   await putItem('call-tokens-issued', { ...auditBase, decision: 'allowed' });
 
   // Store token server-side — return opaque join code (not the raw JWT)
-  const joinCode = await storeJoinSession(jwt, roomName, PUBLIC_LK_URL());
+  const joinCode = await storeJoinSession(jwt, roomName, PUBLIC_LK_URL(), { classId, role: 'student', isHost: false });
   return res.json({ joinCode, roomName, serverUrl: PUBLIC_LK_URL() });
 });
 
@@ -297,7 +344,92 @@ router.get('/token', auth, async (req, res) => {
     token: session.token,
     roomName: session.roomName,
     serverUrl: session.serverUrl,
+    // Pass metadata so client knows role/isHost without decoding JWT
+    meta: session.meta || {},
   });
+});
+
+/**
+ * GET /class/status?joinCode=abc-defg-xyz
+ * Returns whether the class linked to a join code is currently live.
+ * Used by students polling the "Waiting for host" screen.
+ */
+router.get('/status', auth, async (req, res) => {
+  const { joinCode, classId } = req.query;
+
+  // Resolve classId from joinCode if not provided directly
+  let resolvedClassId = classId;
+  if (!resolvedClassId && joinCode) {
+    const session = await getItem('join-sessions', { PK: `JOIN#${joinCode}`, SK: 'META' });
+    if (session?.meta?.classId) resolvedClassId = session.meta.classId;
+    else return res.status(404).json({ error: 'invalid_code' });
+  }
+  if (!resolvedClassId) return res.status(400).json({ error: 'classId_or_joinCode_required' });
+
+  const today = new Date().toISOString().slice(0, 10);
+  const schedule = await getItem('class-schedule', {
+    PK: `CLASS#${resolvedClassId}`,
+    SK: `SCHEDULE#${today}`,
+  });
+
+  if (!schedule) return res.status(404).json({ error: 'no_schedule' });
+
+  return res.json({
+    classId: resolvedClassId,
+    is_live: schedule.is_live ?? false,
+    class_name: schedule.class_name || schedule.title || '',
+    teacher_id: schedule.teacher_id,
+  });
+});
+
+/**
+ * POST /class/log  (any authenticated user)
+ * Logs participant join/leave events for history.
+ * Body: { sessionId, classId, eventType: 'join'|'leave', timestamp }
+ */
+router.post('/log', auth, async (req, res) => {
+  const { sessionId, classId, eventType, timestamp } = req.body || {};
+  if (!eventType) return res.status(400).json({ error: 'eventType_required' });
+
+  const userId = req.user.userId;
+  const now = timestamp || new Date().toISOString();
+  const sid = sessionId || `${classId || 'unknown'}-${Date.now()}`;
+
+  await putItem('participant-events', {
+    PK: `SESSION#${sid}`,
+    SK: `USER#${userId}#${Date.now()}`,
+    user_id: userId,
+    user_name: req.user.name || userId,
+    role: req.user.role || 'student',
+    class_id: classId || '',
+    event_type: eventType,
+    timestamp: now,
+  });
+
+  // For student history: also log a row per-student
+  if (eventType === 'join') {
+    await putItem('meeting-history', {
+      PK: `STUDENT#${userId}`,
+      SK: `ATTEND#${sid}#${Date.now()}`,
+      session_id: sid,
+      class_id: classId || '',
+      event_type: 'join',
+      joined_at: now,
+      type: 'class',
+    });
+  } else if (eventType === 'leave') {
+    await putItem('meeting-history', {
+      PK: `STUDENT#${userId}`,
+      SK: `ATTEND#${sid}#${Date.now()}`,
+      session_id: sid,
+      class_id: classId || '',
+      event_type: 'leave',
+      left_at: now,
+      type: 'class',
+    });
+  }
+
+  return res.json({ ok: true });
 });
 
 /**
@@ -350,7 +482,7 @@ router.post('/create', auth, requireRole('faculty'), async (req, res) => {
 
   await putItem('class-schedule', scheduleItem);
 
-  // Auto-create active enrollment for student s001 so student sees it
+  // Auto-create active enrollment for all students (broad access for now)
   await putItem('class-enrollment', {
     PK: `STUDENT#s001`,
     SK: `CLASS#${classId}`,
@@ -360,20 +492,82 @@ router.post('/create', auth, requireRole('faculty'), async (req, res) => {
 
   // If instant meeting, issue teacher token right away
   if (isInstant) {
-    const token = new AccessToken(LK_API_KEY(), LK_API_SECRET(), { identity: teacherId });
+    const tName = req.user?.name || teacherId;
+    const token = new AccessToken(LK_API_KEY(), LK_API_SECRET(), {
+      identity: teacherId,
+      name: tName,
+      metadata: JSON.stringify({ role: 'faculty', isHost: true, classId }),
+    });
     token.ttl = '4h';
     token.addGrant({
       room: roomName,
       roomJoin: true,
+      roomAdmin: true,
       canPublish: true,
       canPublishData: true,
       canSubscribe: true,
     });
     const jwt = await token.toJwt();
-    return res.json({ classId, roomName, token: jwt, serverUrl: PUBLIC_LK_URL(), is_live: true });
+    const joinCode = await storeJoinSession(jwt, roomName, PUBLIC_LK_URL(), { classId, role: 'faculty', isHost: true });
+    return res.json({ classId, roomName, joinCode, serverUrl: PUBLIC_LK_URL(), is_live: true });
   }
 
   return res.json({ classId, roomName, is_live: false, message: 'Class meeting scheduled successfully' });
+});
+
+/**
+ * GET /history/me  (any authenticated user)
+ * Returns meeting/call history for the currently logged-in user (role-aware).
+ */
+router.get('/history/me', auth, async (req, res) => {
+  const userId = req.user.userId;
+  const role = req.user.role;
+  const { scanItems } = await import('../db/dynamo.js');
+
+  if (role === 'faculty') {
+    // Return all sessions this teacher created
+    const items = await scanItems('meeting-history', {
+      FilterExpression: 'PK = :pk',
+      ExpressionAttributeValues: { ':pk': `TEACHER#${userId}` },
+    });
+    return res.json({ sessions: items || [], role: 'faculty' });
+  }
+
+  if (role === 'student') {
+    // Return attendance events for this student
+    const items = await scanItems('meeting-history', {
+      FilterExpression: 'PK = :pk',
+      ExpressionAttributeValues: { ':pk': `STUDENT#${userId}` },
+    });
+    return res.json({ sessions: items || [], role: 'student' });
+  }
+
+  if (role === 'parent') {
+    const items = await scanItems('meeting-history', {
+      FilterExpression: 'PK = :pk',
+      ExpressionAttributeValues: { ':pk': `PARENT#${userId}` },
+    });
+    return res.json({ sessions: items || [], role: 'parent' });
+  }
+
+  return res.json({ sessions: [], role });
+});
+
+/**
+ * POST /class/kick  (faculty only)
+ * Removes a participant from a LiveKit room using RoomService.removeParticipant.
+ * Body: { roomName, identity }
+ */
+router.post('/kick', auth, requireRole('faculty'), async (req, res) => {
+  const { roomName, identity } = req.body || {};
+  if (!roomName || !identity) return res.status(400).json({ error: 'roomName_and_identity_required' });
+  try {
+    await getRoomService().removeParticipant(roomName, identity);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[kick] error:', err);
+    return res.status(500).json({ error: 'kick_failed', detail: err?.message });
+  }
 });
 
 export default router;
